@@ -1,23 +1,27 @@
 #!/usr/bin/env python3
 """Odoo Reports - each user logs in with their own Odoo login + API key.
 All queries run as that user, so Odoo's own access rights decide what they see.
-
+ 
 Run:   python odoo_reports.py            (personal mode, localhost only)
        python odoo_reports.py --share    (shared mode, reachable on the network)
 Options: --port 8080  --settings path\\to\\settings.json
 Needs only Python 3.8+ (no extra packages).
 """
 import json, os, sys, time, secrets, threading, webbrowser, argparse, calendar
-import urllib.request, urllib.error
+import urllib.request, urllib.error, urllib.parse, socket
 import xmlrpc.client as xc
 from datetime import date, timedelta
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-
+ 
 BASE = os.path.dirname(sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__))
 IDLE_SECONDS = 30 * 60
 SESSIONS, LOCK = {}, threading.Lock()
 CFG = {}
-
+# per-client data lives outside the program (the launcher sets ODOO_REPORTS_DATA), so updates never touch it
+DATA = os.environ.get("ODOO_REPORTS_DATA") or BASE
+SETTINGS_PATH = os.path.join(DATA, "settings.json")
+DEFAULT_MODEL = "gemini-flash-lite-latest"
+ 
 PAGE = r"""<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>تقارير Odoo</title>
 <style>
@@ -38,7 +42,7 @@ table{width:100%;border-collapse:collapse}td,th{padding:8px 4px;border-bottom:1p
 form{max-width:420px;margin:8vh auto}label{display:block;margin:12px 0 4px;font-size:14px}
 input{width:100%;font:inherit;padding:9px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--ink);direction:ltr;text-align:left}
 .err{color:var(--bad);margin-top:12px;min-height:1.5em}.hint{color:var(--mut);font-size:13px;margin-top:14px}
-.hide{display:none}.msg{white-space:pre-wrap}
+.hide{display:none}.msg{white-space:pre-wrap}summary{cursor:pointer;color:var(--acc)}
 </style></head><body><div class="wrap">
 <form id="login" class="card hide"><h1>تسجيل الدخول</h1>
 <div class="sub" id="where"></div>
@@ -46,7 +50,14 @@ input{width:100%;font:inherit;padding:9px;border:1px solid var(--line);border-ra
 <label for="ky">API Key</label><input id="ky" type="password" autocomplete="off" required>
 <div style="margin-top:16px"><button class="p" type="submit">دخول</button></div>
 <div class="err" id="lerr" role="alert"></div>
-<div class="hint">لعمل المفتاح: في Odoo اضغط اسمك ← My Profile ← Account Security ← New API Key (Scope: RPC). المفتاح بيفضل في الذاكرة بس ويتمسح عند الخروج.</div></form>
+<div class="hint">لعمل المفتاح: في Odoo اضغط اسمك ← My Profile ← Account Security ← New API Key (Scope: RPC). المفتاح بيفضل في الذاكرة بس ويتمسح عند الخروج.</div>
+<details id="cfg" class="hide" style="margin-top:14px"><summary>إعدادات الاتصال</summary>
+<label for="c-url">رابط Odoo</label><input id="c-url" placeholder="https://company.odoo.com">
+<label for="c-db">اسم الداتابيس (سيبه فاضي وهيتحدد تلقائي لو Odoo Online)</label><input id="c-db">
+<label for="c-key">مفتاح Gemini (اختياري)</label><input id="c-key" type="password" autocomplete="off">
+<label for="c-model">موديل Gemini</label><input id="c-model" placeholder="gemini-flash-lite-latest">
+<div style="margin-top:12px"><button type="button" class="p" id="c-save">حفظ واختبار الاتصال</button></div>
+<div id="c-msg" class="err" role="status"></div></details></form>
 <div id="app" class="hide">
 <header><div><h1 id="who"></h1><div class="sub" id="upd"></div></div>
 <div><button id="rf">تحديث</button> <button id="lo">خروج</button></div></header>
@@ -93,30 +104,78 @@ function buildChat(){CHAT=el('div');const log=el('div');log.style.cssText='min-h
 function setTab(t){tab=t;$('t-s').setAttribute('aria-selected',t=='sales');$('t-r').setAttribute('aria-selected',t=='receivables');$('t-c').setAttribute('aria-selected',t=='chat');
  if(t=='chat'){$('view').replaceChildren(CHAT||buildChat());$('upd').textContent='';return}load()}
 $('t-s').onclick=()=>setTab('sales');$('t-r').onclick=()=>setTab('receivables');$('t-c').onclick=()=>setTab('chat');$('rf').onclick=load;
+async function loadCfg(){const s=await fetch('/api/settings').then(r=>r.json());
+ $('where').textContent=s.odoo_url?s.odoo_url+'  |  '+s.odoo_db:'لسه مفيش اتصال مضبوط';
+ const d=$('cfg');d.classList.toggle('hide',!s.can_edit);$('c-url').value=s.odoo_url||'';$('c-db').value=s.odoo_db||'';$('c-model').value=s.ai_model||'';
+ $('c-key').placeholder=s.ai_key_set?'محفوظ (سيبه فاضي عشان يفضل زي ما هو)':'اختياري';if(!s.odoo_url&&s.can_edit)d.open=true}
+$('cfg').onkeydown=e=>{if(e.key=='Enter'){e.preventDefault();$('c-save').click()}};
+$('c-save').onclick=async()=>{const m=$('c-msg');m.className='err';m.textContent='';
+ const r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json','X-Requested-With':'fetch'},
+  body:JSON.stringify({odoo_url:$('c-url').value,odoo_db:$('c-db').value,ai_api_key:$('c-key').value,ai_model:$('c-model').value})}).then(r=>r.json());
+ $('c-key').value='';if(r.ok){m.className='sub up';m.textContent='تم الحفظ والاتصال شغّال.';await loadCfg()}else m.textContent=r.error};
 $('lo').onclick=async()=>{await api('/api/logout',{});show(false)};
 $('login').onsubmit=async e=>{e.preventDefault();$('lerr').textContent='';
  const r=await api('/api/login',{email:$('em').value.trim(),key:$('ky').value.trim()});$('ky').value='';
  if(r.ok){$('who').textContent=r.name;show(true);setTab('sales')}else $('lerr').textContent=r.error};
-(async()=>{const m=await fetch('/api/me').then(r=>r.json());$('where').textContent=m.server;
+(async()=>{const m=await fetch('/api/me').then(r=>r.json());await loadCfg();
  if(m.ok){$('who').textContent=m.name;show(true);setTab('sales')}else show(false)})();
 </script></body></html>"""
-
-
+ 
+ 
 def rpc(url, path):
     return xc.ServerProxy(url.rstrip("/") + path, allow_none=True)
-
-
+ 
+ 
 def call(s, model, method, args, **kw):
     kw["context"] = {"allowed_company_ids": s["companies"]}
     return rpc(CFG["odoo_url"], "/xmlrpc/2/object").execute_kw(
         CFG["odoo_db"], s["uid"], s["key"], model, method, args, kw)
-
-
+ 
+ 
+def save_settings(data):
+    raw = str(data.get("odoo_url", "")).strip()
+    u = urllib.parse.urlsplit(raw if "://" in raw else "https://" + raw)
+    if u.scheme not in ("http", "https") or not u.netloc:
+        raise ValueError("رابط Odoo غير صحيح.")
+    base = f"{u.scheme}://{u.netloc}"
+    db = str(data.get("odoo_db", "")).strip()
+    host = u.hostname or ""
+    if not db and host.endswith(".odoo.com"):
+        db = host[:-len(".odoo.com")]
+    if not db:
+        raise ValueError("اكتب اسم الداتابيس.")
+    try:
+        rpc(base, "/xmlrpc/2/common").version()
+    except Exception:
+        raise ValueError("تعذر الاتصال بالرابط ده. راجع الرابط والإنترنت.")
+    new = dict(CFG)
+    new.update(odoo_url=base, odoo_db=db, ai_provider="gemini")
+    key = str(data.get("ai_api_key", "")).strip()
+    if key:
+        if not key.isascii() or " " in key:
+            raise ValueError("مفتاح Gemini فيه حروف غير صحيحة.")
+        new["ai_api_key"] = key
+    model = str(data.get("ai_model", "")).strip()
+    if model:
+        new["ai_model"] = model
+    os.makedirs(os.path.dirname(SETTINGS_PATH) or ".", exist_ok=True)
+    tmp = SETTINGS_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(new, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, SETTINGS_PATH)
+    CFG.clear()
+    CFG.update(new)
+    with LOCK:
+        SESSIONS.clear()
+ 
+ 
 def login(email, key):
+    if not CFG.get("odoo_url"):
+        return None, "الاتصال مش مضبوط. افتح إعدادات الاتصال وحط رابط Odoo."
     try:
         uid = rpc(CFG["odoo_url"], "/xmlrpc/2/common").authenticate(CFG["odoo_db"], email, key, {})
     except Exception:
-        return None, "تعذر الاتصال بـ Odoo. راجع الرابط واسم الداتابيس في settings.json."
+        return None, "تعذر الاتصال بـ Odoo. راجع الرابط واسم الداتابيس في إعدادات الاتصال."
     if not uid:
         return None, "الإيميل أو الـ API Key غير صحيح."
     s = {"uid": uid, "key": key, "companies": [], "t": time.time()}
@@ -127,8 +186,8 @@ def login(email, key):
     except Exception:
         return None, "تم الدخول لكن تعذر قراءة بيانات المستخدم."
     return s, None
-
-
+ 
+ 
 def sales_report(s):
     today = date.today()
     m0 = today.replace(day=1)
@@ -150,8 +209,8 @@ def sales_report(s):
     return {"currency": s["currency"], "today": agg([r for r in month if d(r) == today.isoformat()]),
             "month": agg(month), "prev": agg(prev), "change": ((mt - pt) / pt * 100) if pt else None,
             "top": sorted(by.items(), key=lambda x: -x[1])[:5]}
-
-
+ 
+ 
 def receivables_report(s):
     rows = call(s, "account.move", "search_read",
                 [[("move_type", "=", "out_invoice"), ("state", "=", "posted"),
@@ -166,19 +225,19 @@ def receivables_report(s):
     return {"currency": s["currency"], "count": len(rows), "total": sum(r["amount_residual"] for r in rows),
             "overdue_count": len(late), "overdue": sum(r["amount_residual"] for r in late),
             "top": sorted(by.items(), key=lambda x: -x[1])[:10]}
-
-
+ 
+ 
 class AIError(Exception):
     pass
-
-
+ 
+ 
 GEM = "https://generativelanguage.googleapis.com/v1beta/"
-
-
+ 
+ 
 def gem_request(path, body=None):
     key = CFG.get("ai_api_key", "")
     if not key:
-        raise AIError("المساعد غير مفعّل: ضيف ai_api_key في settings.json.")
+        raise AIError("المساعد غير مفعّل: ضيف مفتاح Gemini في إعدادات الاتصال.")
     req = urllib.request.Request(GEM + path, json.dumps(body).encode() if body is not None else None,
                                  {"Content-Type": "application/json", "x-goog-api-key": key})
     try:
@@ -195,23 +254,23 @@ def gem_request(path, body=None):
         raise AIError("خدمة Gemini مش متاحة دلوقتي. جرّب بعد شوية.")
     except Exception:
         raise AIError("تعذر الاتصال بـ Gemini. راجع الإنترنت.")
-
-
+ 
+ 
 def _dates(a):
     d1, d2 = date.fromisoformat(str(a["date_from"])), date.fromisoformat(str(a["date_to"]))
     if d2 < d1 or (d2 - d1).days > 800:
         raise ValueError("bad range")
     return d1, d2
-
-
+ 
+ 
 def _out(s, title, label, agg, sort_key):
     rows = [[k, round(v[0], 2), v[1]] for k, v in agg.items()]
     rows.sort(key=sort_key)
     cur = s["currency"]
     data = {"currency": cur, "total": round(sum(r[1] for r in rows), 2), "count": sum(r[2] for r in rows), "rows": rows[:30]}
     return data, {"title": title, "headers": [label or "البند", f"المبلغ ({cur})", "العدد"], "rows": rows[:100]}
-
-
+ 
+ 
 def t_sales(s, a):
     d1, d2 = _dates(a)
     g = a.get("group_by", "none")
@@ -219,7 +278,7 @@ def t_sales(s, a):
         raise ValueError("bad group")
     lo, hi = d1.isoformat() + " 00:00:00", (d2 + timedelta(days=1)).isoformat() + " 00:00:00"
     agg = {}
-
+ 
     def put(k, v):
         t = agg.setdefault(k, [0.0, 0])
         t[0] += v
@@ -238,8 +297,8 @@ def t_sales(s, a):
             put(k, r["amount_total"])
     label = {"none": "", "customer": "العميل", "salesperson": "المندوب", "product": "المنتج", "day": "اليوم"}[g]
     return _out(s, f"المبيعات من {d1} إلى {d2}", label, agg, (lambda r: r[0]) if g == "day" else (lambda r: -r[1]))
-
-
+ 
+ 
 def t_recv(s, a):
     g = a.get("group_by", "none")
     if g not in ("none", "customer"):
@@ -255,8 +314,8 @@ def t_recv(s, a):
         t[0] += r["amount_residual"]
         t[1] += 1
     return _out(s, "المستحقات المتأخرة" if only else "المستحقات", "العميل" if g == "customer" else "", agg, lambda r: -r[1])
-
-
+ 
+ 
 TOOLS = {"sales_report": t_sales, "receivables_report": t_recv}
 _DATE = {"type": "string", "description": "YYYY-MM-DD"}
 DECL = [
@@ -268,8 +327,8 @@ DECL = [
      "parameters": {"type": "object", "properties": {"group_by": {"type": "string", "enum": ["none", "customer"]},
                     "overdue_only": {"type": "boolean"}}}},
 ]
-
-
+ 
+ 
 def run_tool(s, name, args, tables):
     try:
         data, table = TOOLS[name](s, args)
@@ -279,8 +338,8 @@ def run_tool(s, name, args, tables):
         return {"error": "bad arguments"}
     tables.append(table)
     return data
-
-
+ 
+ 
 def chat(s, text):
     sysmsg = (f"You are the reports assistant inside an Odoo reporting screen. Today is {date.today().isoformat()} "
               f"(weeks start Monday). Currency: {s['currency']}. Get every number from the tools; never invent or "
@@ -293,7 +352,7 @@ def chat(s, text):
     work = list(s.get("chat", [])) + [user]
     tables = []
     for _ in range(5):
-        resp = gem_request(f"models/{CFG.get('ai_model', '')}:generateContent",
+        resp = gem_request(f"models/{CFG.get('ai_model') or DEFAULT_MODEL}:generateContent",
                            {"systemInstruction": {"parts": [{"text": sysmsg}]}, "contents": work,
                             "tools": [{"functionDeclarations": DECL}]})
         content = ((resp.get("candidates") or [{}])[0]).get("content") or {}
@@ -309,15 +368,15 @@ def chat(s, text):
             {"functionResponse": {"name": c["name"], "response": {"result": run_tool(s, c["name"], c.get("args") or {}, tables)}}}
             for c in calls]})
     return "الطلب محتاج خطوات كتير. جرّب تقسمه لطلبات أصغر.", tables
-
-
+ 
+ 
 REPORTS = {"/api/sales": sales_report, "/api/receivables": receivables_report}
-
-
+ 
+ 
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a):  # never log requests (they may carry keys)
         pass
-
+ 
     def send(self, code, body, ctype="application/json", extra=None):
         b = body if isinstance(body, bytes) else (body if ctype != "application/json" else json.dumps(body)).encode()
         self.send_response(code)
@@ -329,7 +388,7 @@ class H(BaseHTTPRequestHandler):
             self.send_header(k, v)
         self.end_headers()
         self.wfile.write(b)
-
+ 
     def sess(self):
         tok = ""
         for part in self.headers.get("Cookie", "").split(";"):
@@ -344,16 +403,26 @@ class H(BaseHTTPRequestHandler):
             if s:
                 s["t"] = time.time()
         return tok, s
-
+ 
+    def local_only(self):
+        # settings may be changed only from the machine running the program (stops network users
+        # from pointing the login screen at another server)
+        host = self.headers.get("Host", "").rsplit(":", 1)[0]
+        return self.client_address[0] in ("127.0.0.1", "::1") and host in ("localhost", "127.0.0.1", "[::1]")
+ 
     def do_GET(self):
         if self.path in ("/", "/index.html"):
             return self.send(200, PAGE, "text/html")
         tok, s = self.sess()
         if self.path == "/api/me":
-            r = {"ok": bool(s), "server": CFG["odoo_url"] + "  |  " + CFG["odoo_db"]}
+            r = {"ok": bool(s)}
             if s:
                 r["name"] = s["name"]
             return self.send(200, r)
+        if self.path == "/api/settings":
+            return self.send(200, {"odoo_url": CFG.get("odoo_url", ""), "odoo_db": CFG.get("odoo_db", ""),
+                                   "ai_model": CFG.get("ai_model", ""), "ai_key_set": bool(CFG.get("ai_api_key")),
+                                   "can_edit": self.local_only()})
         if self.path in REPORTS:
             if not s:
                 return self.send(401, {"error": "auth"})
@@ -367,7 +436,7 @@ class H(BaseHTTPRequestHandler):
             except Exception:
                 return self.send(200, {"error": "تعذر الاتصال بـ Odoo."})
         self.send(404, {"error": "not found"})
-
+ 
     def do_POST(self):
         n = int(self.headers.get("Content-Length", 0) or 0)
         try:
@@ -384,6 +453,16 @@ class H(BaseHTTPRequestHandler):
                 SESSIONS[tok] = s
             return self.send(200, {"ok": True, "name": s["name"]},
                              extra={"Set-Cookie": f"sid={tok}; HttpOnly; SameSite=Strict; Path=/"})
+        if self.path == "/api/settings":
+            if not self.local_only() or self.headers.get("X-Requested-With") != "fetch":
+                return self.send(403, {"ok": False, "error": "التعديل متاح من الجهاز اللي شغّال عليه البرنامج بس."})
+            try:
+                save_settings(data)
+            except ValueError as e:
+                return self.send(200, {"ok": False, "error": str(e)})
+            except Exception:
+                return self.send(200, {"ok": False, "error": "تعذر حفظ الإعدادات."})
+            return self.send(200, {"ok": True})
         if self.path == "/api/chat":
             tok, s = self.sess()
             if not s:
@@ -404,20 +483,23 @@ class H(BaseHTTPRequestHandler):
                 SESSIONS.pop(tok, None)
             return self.send(200, {"ok": True})
         self.send(404, {"error": "not found"})
-
-
+ 
+ 
 def main():
+    global SETTINGS_PATH
     ap = argparse.ArgumentParser()
     ap.add_argument("--share", action="store_true", help="allow other devices on the network")
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--models", action="store_true", help="list Gemini models you can use for ai_model")
-    ap.add_argument("--settings", default=os.path.join(BASE, "settings.json"))
+    ap.add_argument("--settings", default=SETTINGS_PATH)
     a = ap.parse_args()
-    try:
-        CFG.update(json.load(open(a.settings, encoding="utf-8")))
-        CFG["odoo_url"], CFG["odoo_db"]
-    except Exception:
-        sys.exit("settings.json missing or incomplete: it needs odoo_url and odoo_db.")
+    SETTINGS_PATH = a.settings
+    socket.setdefaulttimeout(20)
+    if os.path.exists(a.settings):
+        try:
+            CFG.update(json.load(open(a.settings, encoding="utf-8")))
+        except Exception:
+            sys.exit("settings.json is not valid JSON (save it as UTF-8). Delete it to set up from the screen.")
     if a.models:
         try:
             for m in gem_request("models?pageSize=100").get("models", []):
@@ -436,7 +518,7 @@ def main():
         srv.serve_forever()
     except KeyboardInterrupt:
         pass
-
-
+ 
+ 
 if __name__ == "__main__":
     main()
